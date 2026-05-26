@@ -9,12 +9,7 @@ from pyquaternion import Quaternion
 from nuscenes.utils.data_classes import Box as NuScenesBox
 from nuscenes.utils.geometry_utils import view_points, box_in_image, BoxVisibility, transform_matrix
 
-from tools.visualization.bev_render import (
-    color_mapping, 
-    SCORE_THRESH, 
-    MAP_SCORE_THRESH,
-    CMD_LIST
-)
+from tools.visualization.bev_render import color_mapping, CMD_LIST
 
 
 CAM_NAMES_NUSC = [
@@ -34,13 +29,23 @@ CAM_NAMES_NUSC_converter = [
     'CAM_BACK_RIGHT',
 ]
 
+def orthonormalize_rotation(rotation):
+    u, _, vh = np.linalg.svd(rotation)
+    orthogonal = u @ vh
+    if np.linalg.det(orthogonal) < 0:
+        u[:, -1] *= -1
+        orthogonal = u @ vh
+    return orthogonal
+
 class CamRender:
     def __init__(
         self, 
         plot_choices,
         out_dir,
+        score_thresh=0.3,
     ):
         self.plot_choices = plot_choices
+        self.score_thresh = score_thresh
         self.pred_dir = os.path.join(out_dir, "cam_pred")
         os.makedirs(self.pred_dir, exist_ok=True)
 
@@ -113,12 +118,12 @@ class CamRender:
             lidar2cam = data['lidar2cam']
             extrinsic = lidar2cam[idx]
             trans = extrinsic[3, :3]
-            rot = Quaternion(matrix=extrinsic[:3, :3]).inverse
+            rot = Quaternion(matrix=orthonormalize_rotation(extrinsic[:3, :3])).inverse
             imsize = (1600, 900)
 
             for i in range(result['labels_3d'].shape[0]):
                 score = result['scores_3d'][i]
-                if score < SCORE_THRESH: 
+                if score < self.score_thresh: 
                     continue
                 color = color_mapping[result['instance_ids'][i] % len(color_mapping)]
                 
@@ -156,12 +161,12 @@ class CamRender:
             lidar2cam = data['lidar2cam']
             extrinsic = lidar2cam[idx]
             trans = extrinsic[3, :3]
-            rot = Quaternion(matrix=extrinsic[:3, :3]).inverse
+            rot = Quaternion(matrix=orthonormalize_rotation(extrinsic[:3, :3])).inverse
             imsize = (1600, 900)
 
             for i in range(result['labels_3d'].shape[0]):
                 score = result['scores_3d'][i]
-                if score < SCORE_THRESH: 
+                if score < self.score_thresh: 
                     continue
                 color = color_mapping[result['instance_ids'][i] % len(color_mapping)]
                 
@@ -232,7 +237,7 @@ class CamRender:
         lidar2cam = data['lidar2cam']
         extrinsic = lidar2cam[idx]
         trans = extrinsic[3, :3]
-        rot = Quaternion(matrix=extrinsic[:3, :3]).inverse
+        rot = Quaternion(matrix=orthonormalize_rotation(extrinsic[:3, :3])).inverse
         # plan_trajs = result['planning'][0].cpu().numpy()
         # plan_trajs = plan_trajs.reshape(3, -1, 6, 2)
         # num_cmd = len(CMD_LIST)

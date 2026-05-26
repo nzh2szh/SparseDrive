@@ -23,7 +23,6 @@ plot_choices = dict(
     planning = True,
 )
 START = 0
-END = 81
 INTERVAL = 1
 
 
@@ -40,8 +39,17 @@ class Visualizer:
         cfg = Config.fromfile(args.config)
         self.dataset = build_dataset(cfg.data.val)
         self.results = mmcv.load(args.result_path)
-        self.bev_render = BEVRender(plot_choices, self.out_dir)
-        self.cam_render = CamRender(plot_choices, self.out_dir)
+        self.bev_render = BEVRender(
+            plot_choices,
+            self.out_dir,
+            score_thresh=args.score_thresh,
+            map_score_thresh=args.map_score_thresh,
+        )
+        self.cam_render = CamRender(
+            plot_choices,
+            self.out_dir,
+            score_thresh=args.score_thresh,
+        )
 
     def add_vis(self, index):
         data = self.dataset.get_data_info(index)
@@ -91,6 +99,16 @@ def parse_args():
         '--out-dir', 
         default='vis',
         help='directory where visualize results will be saved')
+    parser.add_argument(
+        '--score-thresh',
+        type=float,
+        default=0.3,
+        help='threshold for inference perception boxes in BEV and camera views')
+    parser.add_argument(
+        '--map-score-thresh',
+        type=float,
+        default=0.3,
+        help='threshold for inference map vectors in BEV view')
     args = parser.parse_args()
 
     return args
@@ -99,8 +117,9 @@ def main():
     args = parse_args()
     visualizer = Visualizer(args, plot_choices)
 
-    for idx in tqdm(range(START, END, INTERVAL)):
-        if idx > len(visualizer.results):
+    end = min(len(visualizer.results), len(visualizer.dataset))
+    for idx in tqdm(range(START, end, INTERVAL)):
+        if idx >= len(visualizer.results):
             break
         visualizer.add_vis(idx)
     

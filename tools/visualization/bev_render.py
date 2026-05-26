@@ -9,8 +9,6 @@ from projects.mmdet3d_plugin.datasets.utils import box3d_to_corners
  
 CMD_LIST = ['Turn Right', 'Turn Left', 'Go Straight']
 COLOR_VECTORS = ['cornflowerblue', 'royalblue', 'slategrey']
-SCORE_THRESH = 0.3
-MAP_SCORE_THRESH = 0.3
 color_mapping = np.asarray([
     [0, 0, 0],
     [255, 179, 0],
@@ -92,10 +90,14 @@ class BEVRender:
         out_dir,
         xlim = 40,
         ylim = 40,
+        score_thresh=0.3,
+        map_score_thresh=0.3,
     ):
         self.plot_choices = plot_choices
         self.xlim = xlim
         self.ylim = ylim
+        self.score_thresh = score_thresh
+        self.map_score_thresh = map_score_thresh
         self.gt_dir = os.path.join(out_dir, "bev_gt")
         self.pred_dir = os.path.join(out_dir, "bev_pred")
         os.makedirs(self.gt_dir, exist_ok=True)
@@ -175,7 +177,7 @@ class BEVRender:
         bboxes = result['boxes_3d']
         for i in range(result['labels_3d'].shape[0]):
             score = result['scores_3d'][i]
-            if score < SCORE_THRESH: 
+            if score < self.score_thresh: 
                 continue
             color = color_mapping[result['instance_ids'][i] % len(color_mapping)]
 
@@ -201,7 +203,7 @@ class BEVRender:
         bboxes = result['boxes_3d']
         for i in range(result['labels_3d'].shape[0]):
             score = result['scores_3d'][i]
-            if score < SCORE_THRESH: 
+            if score < self.score_thresh: 
                 continue
             color = color_mapping[result['instance_ids'][i] % len(color_mapping)]
             center = bboxes[i, :3]
@@ -260,7 +262,7 @@ class BEVRender:
         labels = result['labels_3d']
         for i in range(result['labels_3d'].shape[0]):
             score = result['scores_3d'][i]
-            if score < SCORE_THRESH: 
+            if score < self.score_thresh: 
                 continue
             label = labels[i]
             vehicle_id_list = [0, 1, 2, 3, 4, 6, 7]
@@ -304,7 +306,7 @@ class BEVRender:
 
         for i in range(result['scores'].shape[0]):
             score = result['scores'][i]
-            if  score < MAP_SCORE_THRESH:
+            if  score < self.map_score_thresh:
                 continue
             color = COLOR_VECTORS[result['labels'][i]]
             pts = result['vectors'][i]
@@ -318,14 +320,16 @@ class BEVRender:
 
         # draw planning gt
         masks = data['gt_ego_fut_masks'].astype(bool)
-        if masks[0] != 0:
-            plan_traj = data['gt_ego_fut_trajs'][masks]
-            cmd = data['gt_ego_fut_cmd']
-            plan_traj[abs(plan_traj) < 0.01] = 0.0
-            plan_traj = plan_traj.cumsum(axis=0)
-            plan_traj = np.concatenate((np.zeros((1, plan_traj.shape[1])), plan_traj), axis=0)
-            self._render_traj(plan_traj, traj_score=1.0,
-                colormap='autumn', dot_size=50)
+        if masks.size == 0 or not masks.any():
+            return
+
+        plan_traj = data['gt_ego_fut_trajs'][masks]
+        cmd = data['gt_ego_fut_cmd']
+        plan_traj[abs(plan_traj) < 0.01] = 0.0
+        plan_traj = plan_traj.cumsum(axis=0)
+        plan_traj = np.concatenate((np.zeros((1, plan_traj.shape[1])), plan_traj), axis=0)
+        self._render_traj(plan_traj, traj_score=1.0,
+            colormap='autumn', dot_size=50)
 
     def draw_planning_pred(self, data, result, top_k=3):
         if not (self.plot_choices['draw_pred'] and self.plot_choices['planning'] and "planning" in result):
