@@ -7,6 +7,49 @@ tools: [ "#codebase", "#terminal" ]
 # Role
 你是一个自动驾驶感知算法工程师，精通 SparseDrive 的数据预处理流程。你的任务是协助开发者编写 Python 程序，该程序的作用是将源数据（原始离线数据）制作成.pkl。
 
+## 与当前代码一致的实现说明（以 `tools/daq_data_converter/daq_data_converter.py` 为准）
+
+以下规则用于覆盖本文档中与历史版本不一致的描述。
+
+1. 坐标基适配（DAQ -> 目标）
+- 代码中定义了固定基变换矩阵 `DAQ_TO_TARGET_ROT`：
+    - DAQ: 前X、左Y、上Z
+    - 目标: 右X、前Y、上Z
+    - 向量变换：`[x_t, y_t, z_t] = [-y_d, x_d, z_d]`
+
+2. 变换函数语义
+- `convert_transform_daq_to_ego(T)`：用于 lidar/ego 这类两端都在 DAQ 车体系下定义的 4x4 变换，按 `C @ T @ C^T` 做基变换。
+- `convert_sensor_to_ego_transform_daq_to_target(T_sensor2ego)`：用于 camera->ego 变换（相机坐标系不改、仅 ego 基变），按 `C @ T` 转换。
+- `convert_ego_to_global_quaternion_daq_to_target(q)`：全局 ENU 不变，仅 ego 基变；按旋转矩阵 `R_ego2global_target = R_ego2global_daq @ C^T`。
+
+3. `cams[*]` 字段生成规则
+- `sensor2ego_*`：来源于 `T_c_b_static` 先求逆得到 `sensor->ego`，再调用 `convert_sensor_to_ego_transform_daq_to_target`。
+- `sensor2lidar_*`：基于
+    - `sensor2ego`（已按上一条转换）
+    - `lidar_to_vehicle` 先经 `convert_transform_daq_to_ego` 转到目标基
+    - 计算 `sensor2lidar = inv(lidar_to_vehicle_target) @ sensor2ego`
+- `sensor2lidar_rotation` 当前存储为 3x3 矩阵本体（不做转置写入）。
+- `ego2global_*`（每相机）来自该相机 `pose`，四元数归一化后再做 `convert_ego_to_global_quaternion_daq_to_target`。
+
+4. 顶层 `ego2global`、`lidar2ego` 与时间戳
+- 顶层 `ego2global_*` 取 `EGO_POSE_CAMERA_NAME = SideFrontCam01_preproc` 的 `pose`，并做同样四元数转换。
+- 顶层 `timestamp` 使用该锚相机的纳秒时间戳转微秒。
+- 顶层 `lidar2ego_*` 来源于 `lidar_to_vehicle` 先做 `convert_transform_daq_to_ego` 后再拆分平移+四元数。
+
+5. `ego_status` 与速度
+- `ego_status` 固定为 10 维：`[ax, ay, az, wx, wy, wz, vx, vy, vz, steering_angle]`。
+- 其中前 6 维当前置 0。
+- `v*` 由相邻帧锚相机 `pose.position` 的全局差分，结合当前（已转换）`ego2global` 旋转回 ego 得到。
+- `steering_angle` 取 `can_bus.json` 中最邻近当前帧时间的 `steeringAngle`。
+
+6. 输出结构与占位字段
+- 输出 pkl 结构固定：`{'infos': [...], 'metadata': {'version': 'v1.0-trainval'}}`。
+- 当前为推理场景，`gt_boxes/gt_names/gt_velocity/...` 等标注字段均为空占位（shape 与 dtype 按 NuScenes3DDataset 兼容要求填充）。
+
+7. 开发注意事项
+- 修改 converter 后，必须重新生成 `daq_data_infos_infe.pkl` 并重新跑测试得到新的 `results.pkl`；旧结果与新 info 混用会导致错误判断。
+- 若要调整 `sensor2lidar_rotation` 的“是否转置写入”语义，必须与消费者读取逻辑同步设计；否则会直接导致相机投影错误。
+
 # 核心工作流指令
 
 ## 第一步：理解源数据 (Understand source data)
@@ -53,7 +96,7 @@ tools: [ "#codebase", "#terminal" ]
     "camera_calibration": {
         "cameras": [
             {
-                "T_c_b": [  //经过运动补偿的，同级"name"中对应的相机外参，是自车坐标系到相机坐标系的变换矩阵，车体坐标系定义：前X左Y上Z，相机坐标系定义：前Z右X下Y
+                "T_c_b": [  //经过运动补偿的，同级"name"中对应的相机外参，是ego车体坐标系到相机坐标系的变换矩阵（此处是源数据定义）
                     [
                         0.0023857165712309124,
                         -0.9999063368075576,
@@ -79,7 +122,7 @@ tools: [ "#codebase", "#terminal" ]
                         1
                     ]
                 ],
-                "T_c_b_static": [   //同级"name"中对应的相机静态外参，是自车坐标系到相机坐标系的变换矩阵，车体坐标系定义：前X左Y上Z，相机坐标系定义：前Z右X下Y
+                "T_c_b_static": [   //同级"name"中对应的相机静态外参，是ego车体坐标系到相机坐标系的变换矩阵（此处是源数据定义）
                     [
                         0.002246290885133491,
                         -0.9999034993680277,
@@ -144,17 +187,17 @@ tools: [ "#codebase", "#terminal" ]
                 "shutter_interval": 0.000014642,
                 "time_offset": -9778976,
                 "timestamp": 1778635415744937984,   //同级"name"中对应的相机时间戳，Epoch时间，单位纳秒
-                "vc": [  //同级timestamp时的自车线速度，单位m/s
+                "vc": [  //同级timestamp时的相机坐标系下的线速度，物体相对相机的运动速度，单位m/s
                     -0.603749282974217, //x
                     -0.791859525397831, //y
                     -15.077664940085437 //z
                 ],
-                "wc": [  //同级timestamp的自车角速度，单位rad/s
+                "wc": [  //同级timestamp的相机坐标系下角速度，物体相对相机的运动角速度，单位rad/s
                     0.033799130735817695,   //x
                     0.014500655335963578,   //y
                     -0.011704488563407407   //z
                 ],
-                "pose": {   //同级timestamp（如："timestamp": 1778635415744937984）时，自车的pose，包含orientation（四元数，w,x,y,z）和position（高斯-克吕格投影，东坐标，北坐标，高程）
+                "pose": {   //同级timestamp（如："timestamp": 1778635415744937984）时，global坐标系下车体的pose，包含orientation（四元数，w,x,y,z）和position，global坐标系：东X，北Y，天Z
                     "orientation": [
                         0.2097879446413111, //w
                         -0.0020141286059345703, //x
@@ -164,7 +207,7 @@ tools: [ "#codebase", "#terminal" ]
                     "position": [
                         351188.83411071415, //东
                         3473810.753541572,  //北
-                        15.05051189399733   //高
+                        15.05051189399733   //天
                     ]
                 }
             },
@@ -185,7 +228,7 @@ tools: [ "#codebase", "#terminal" ]
         }
     },
     "frame_main_timestamp": 1778635415.735159,   //主lidar时间戳，Epoch时间，单位秒
-    "pose": {   //同级中frame_main_timestamp时（主lidar时间戳，如："frame_main_timestamp": 1778635415.735159）时，自车的pose，包含orientation（四元数，w,x,y,z）和position（高斯-克吕格投影，东坐标，北坐标，高程）
+    "pose": {   //同级中frame_main_timestamp时（主lidar时间戳，如："frame_main_timestamp": 1778635415.735159）时，global坐标系下车体的pose，包含orientation（四元数，w,x,y,z）和position，global坐标系：东X，北Y，天Z
         "orientation": [
             0.20971841463883648,    //w
             -0.0019179266595880744, //x
@@ -234,18 +277,20 @@ tools: [ "#codebase", "#terminal" ]
     # 第 1 帧 (Sample 1)
     {
         'token': 'unique_sample_token_string',  # 源数据中没有该信息，可以自动生成一个唯一表示的token值
-        'timestamp': 1778635416044594,  # 微秒级时间戳，用frame_info_preproc.json中FrontCam02_preproc同级的timestamp（其值是纳秒级时间戳，需要转换成微妙级时间戳）
+        'timestamp': 1778635416048097,  # 微秒级时间戳，用frame_info_preproc.json中SideFrontCam01_preproc同级的timestamp（其值是纳秒级时间戳，需要转换成微妙级时间戳）
         
         # 1. 传感器数据与内外参，例如：
         'cams': {
             'CAM_FRONT': {
-                'data_path': '/abs/path/to/data/daq_data_rst/1778635416_000/1778635416.044595_FrontCam02_preproc.jpeg',    # 对于CAN_FRONT，用FrontCam02_preproc相关信息；这里必须是 `mmcv.imread` 能直接读取的路径，推荐写绝对路径
+                'data_path': '/abs/path/to/data/daq_data_rst/1778635416_000/1778635416.044595_FrontCam02_preproc.jpeg', # 对于CAN_FRONT，用FrontCam02_preproc相关信息；这里必须是 `mmcv.imread` 能直接读取的路径，推荐写绝对路径
+                'type': 'CAM_FRONT', # FrontCam02_preproc对应CAM_FRONT
                 'cam_intrinsic': np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]]), # 3x3 内参，作为 numpy array 存储，来自frame_info_preproc.json中FrontCam02_preproc同级的camera_matrix
-                'sensor2ego_translation': [x, y, z],                  # 相机相对于自车的外参平移，可由frame_info_preporc.json中FrontCam02_preproc同级T_c_b_static（自车到相机的4x4外参变换矩阵）先取逆后得到
-                'sensor2ego_rotation': [q1, q2, q3, q4],              # 相机相对于自车的外参旋转(四元数)，可由frame_info_preporc.json中FrontCam02_preproc同级T_c_b_static（自车到相机的4x4外参变换矩阵）先取逆后得到，注意这里结果的顺序是[w,x,y,z]
-                # 若无雷达/点云信息，推荐补齐以下字段以便 Dataset 能正常工作：
-                'sensor2lidar_rotation': 3x3矩阵,  # 相机相对于Lidar的旋转，可先由T_c_b_static取逆得到sensor2ego，再结合lidar_to_vehicle_extrinsic.yaml中T_v_l0（自车相对于Lidar的4x4外参）进行计算
-                'sensor2lidar_translation': [x, y, z],  # 相机相对于Lidar的平移，可先由T_c_b_static取逆得到sensor2ego，再结合lidar_to_vehicle_extrinsic.yaml中T_v_l0（自车相对于Lidar的4x4外参）进行计算
+                'sensor2ego_translation': [x, y, z],    # camera->ego 外参平移；由 T_c_b_static 先求逆得到 sensor->ego，再按“与当前代码一致的实现说明”中规则做 DAQ->目标基转换
+                'sensor2ego_rotation': [q1, q2, q3, q4],    # camera->ego 外参旋转(四元数)；结果顺序 [w,x,y,z]，转换规则同上
+                'ego2global_translation': [x, y, z],    # ego->global 平移（global ENU 不变）
+                'ego2global_rotation': [q1, q2, q3, q4],    # ego->global 旋转(四元数，顺序 [w,x,y,z])；按实现章节做 ego 基变换
+                'sensor2lidar_translation': [x, y, z],  # camera->lidar 平移；由 sensor2ego 与转换后的 lidar2ego 链路计算
+                'sensor2lidar_rotation': # 3x3矩阵，camera->lidar 旋转；当前实现存储矩阵本体（不做转置写入）
             },
             'CAM_FRONT_RIGHT': { ... }, # 内容参照CAM_FRONT，但是用SideFrontCam02_preproc相机相关信息
             'CAM_FRONT_LEFT': { ... },  # 内容参照CAM_FRONT，用SideFrontCam01_preproc相机相关信息
@@ -254,15 +299,17 @@ tools: [ "#codebase", "#terminal" ]
             'CAM_BACK_RIGHT': { ... }   # 内容参照CAM_FRONT，用SideRearCam02_preproc相机相关信息
         },
         
-        # 2. 自车状态（Ego Pose - 全局坐标系）
-        'ego2global_translation': [X, Y, Z],      # 自车在世界/全局坐标系下的位置，可由frame_info_preporc.json中FrontCam02_preproc同级pose中的position转换得到
-        'ego2global_rotation': [Q1, Q2, Q3, Q4],  # 自车在世界/全局坐标系下的姿态(四元数)，可由frame_info_preproc.json中FrontCam02_preproc同级pose中的orientation转换得到,注意frame_info_preproc.json中的顺序是[w,x,y,z]，这里结果的顺序是[w,x,y,z]
+        # 2. ego状态（Ego Pose - 全局坐标系）
+        'ego2global_translation': [X, Y, Z],      # ego->global 平移，来自锚相机 pose.position
+        'ego2global_rotation': [Q1, Q2, Q3, Q4],  # ego->global 旋转(四元数，[w,x,y,z])，来自锚相机 pose.orientation 并按实现章节转换
         
-        # 3. 规划与控制所需的自车动态物理量（SparseDrive特有或扩展）
-        'ego_status': np.array([vx, vy, vz, ax, ay, az, jx, jy, jz, steering_angle], dtype=np.float32),
+        # 3. 规划与控制所需的 ego 动态物理量（SparseDrive特有或扩展）
+        'ego_status': np.array([ax, ay, az, wx, wy, wz, vx, vy, vz, steering_angle], dtype=np.float32),
             # 为兼容 downstream，推荐将 ego_status 存为长度 10 的 numpy 数组：
-            # [vx, vy, vz, ax, ay, az, can_bus_jerk_x, can_bus_jerk_y, can_bus_jerk_z, steering_angle]
-            # vx, xy, xz可由frame_info_preproc.json中FrontCam02_preproc同级vc转换得到
+            # [ax, ay, az, wx, wy, wz, vx, vy, vz, steering_angle]
+            # ax, ay, az是自车加速度三分量，ego坐标系x,y,z，m/s^2，可置0
+            # wx, wy, wz是自车角速度三分量，ego坐标系x,y,z，rad/s，可置0
+            # vx, vy, vz 是自车速度三分量（ego坐标系，m/s），由相邻帧锚相机 pose 的全局差分结合当前 ego2global 旋转回 ego 计算
             # steering_angle可选择can_bus.json中steeringAngel中，时间最借鉴当前帧timestamp的value
         
         # 4. 时序指针（用于构建时序记忆队列）
@@ -279,8 +326,8 @@ tools: [ "#codebase", "#terminal" ]
         'map_location': '',
         'lidar_path': '',
         'sweeps': [],
-        'lidar2ego_translation': [x, y, z], # Lidar相对于自车的平移，lidar_to_vehicle_extrinsic.yaml中T_v_l0是自车相对于Lidar的外参，可根据进行相关信息计算
-        'lidar2ego_rotation': [q1, q2, q3, q4], # Lidar相对自车的旋转，lidar_to_vehicle_extrinsic.yaml中T_v_l0是自车相对于Lidar的外参，可根据进行相关信息计算，注意这里结果的顺序是[w,x,y,z]
+        'lidar2ego_translation': [x, y, z], # lidar->ego的平移，可由lidar_to_vehicle_extrinsic.yaml中T_v_l0（lidar->daq_ego的4x4外参）计算
+        'lidar2ego_rotation': [q1, q2, q3, q4], # lidar->ego车体的旋转，可由lidar_to_vehicle_extrinsic.yaml中T_v_l0（lidar->daq_ego的4x4外参）计算；注意这里结果的顺序是[w,x,y,z]
         'map_annos': {},
         'num_lidar_pts': np.zeros((0,), dtype=np.int64),
         'valid_flag': np.zeros((0,), dtype=bool),

@@ -5,7 +5,7 @@ Usage:
     python scripts/daq_data_converter/daq_data_converter.py \
             -i /abs/path/to/data/daq_data_rst \
             -o /abs/path/to/output \
-    -c 45
+            --steering-thresh-deg 45
 """
 
 from __future__ import annotations
@@ -34,6 +34,20 @@ CAMERA_NAME_MAP = {
     "CAM_BACK_LEFT": "SideRearCam01_preproc",
     "CAM_BACK_RIGHT": "SideRearCam02_preproc",
 }
+EGO_POSE_CAMERA_NAME = "SideFrontCam01_preproc"
+
+# Axis conversion requested for DAQ -> target lidar convention:
+# DAQ lidar:   x-forward, y-left,  z-up
+# target lidar: x-right,  y-forward, z-up
+# so [x_t, y_t, z_t] = [-y_d, x_d, z_d]
+DAQ_TO_TARGET_ROT = np.array(
+    [
+        [0.0, -1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -181,6 +195,70 @@ def matrix_to_translation_rotation(matrix: np.ndarray) -> tuple[np.ndarray, np.n
     return translation, rotation
 
 
+def quaternion_wxyz_to_matrix(quaternion: np.ndarray) -> np.ndarray:
+    quaternion = np.asarray(quaternion, dtype=np.float64).reshape(4)
+    norm = float(np.linalg.norm(quaternion))
+    if norm == 0.0:
+        raise ValueError("quaternion norm must be non-zero")
+
+    qw, qx, qy, qz = quaternion / norm
+    return np.array(
+        [
+            [1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qw * qz), 2.0 * (qx * qz + qw * qy)],
+            [2.0 * (qx * qy + qw * qz), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qw * qx)],
+            [2.0 * (qx * qz - qw * qy), 2.0 * (qy * qz + qw * qx), 1.0 - 2.0 * (qx * qx + qy * qy)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def convert_transform_daq_to_ego(transform: np.ndarray) -> np.ndarray:
+    transform = np.asarray(transform, dtype=np.float64)
+    if transform.shape != (4, 4):
+        raise ValueError(f"transform shape must be 4x4, got {transform.shape}")
+    basis = np.eye(4, dtype=np.float64)
+    basis[:3, :3] = DAQ_TO_TARGET_ROT
+    basis_inv = np.eye(4, dtype=np.float64)
+    basis_inv[:3, :3] = DAQ_TO_TARGET_ROT.T
+    # Convert a rigid transform matrix representation under axis basis change.
+    return basis @ transform @ basis_inv
+
+
+def convert_sensor_to_ego_transform_daq_to_target(transform: np.ndarray) -> np.ndarray:
+    """Convert sensor->ego transform when only ego basis changes.
+
+    Camera/sensor basis is kept unchanged, while ego basis is converted from
+    DAQ to target convention.
+    """
+    transform = np.asarray(transform, dtype=np.float64)
+    if transform.shape != (4, 4):
+        raise ValueError(f"transform shape must be 4x4, got {transform.shape}")
+
+    basis = np.eye(4, dtype=np.float64)
+    basis[:3, :3] = DAQ_TO_TARGET_ROT
+    return basis @ transform
+
+
+def convert_rotation_daq_to_ego(rotation: np.ndarray) -> np.ndarray:
+    rotation = np.asarray(rotation, dtype=np.float64)
+    if rotation.shape != (3, 3):
+        raise ValueError(f"rotation matrix shape must be 3x3, got {rotation.shape}")
+    return DAQ_TO_TARGET_ROT @ rotation @ DAQ_TO_TARGET_ROT.T
+
+
+def convert_vector_daq_to_ego(vector: np.ndarray) -> np.ndarray:
+    vector = np.asarray(vector, dtype=np.float64).reshape(3)
+    return DAQ_TO_TARGET_ROT @ vector
+
+
+def convert_ego_to_global_quaternion_daq_to_target(quaternion_wxyz: np.ndarray) -> np.ndarray:
+    quaternion_wxyz = np.asarray(quaternion_wxyz, dtype=np.float64).reshape(4)
+    rotation_ego_to_global_daq = quaternion_wxyz_to_matrix(quaternion_wxyz)
+    # Global basis stays ENU; only ego basis changes.
+    rotation_ego_to_global_target = rotation_ego_to_global_daq @ DAQ_TO_TARGET_ROT.T
+    return matrix_to_quaternion_wxyz(rotation_ego_to_global_target)
+
+
 def matrix_to_quaternion_wxyz(matrix: np.ndarray) -> np.ndarray:
     rotation = np.asarray(matrix, dtype=np.float64)
     if rotation.shape != (3, 3):
@@ -234,7 +312,7 @@ def extract_camera_entry(camera: dict[str, Any]) -> tuple[np.ndarray, np.ndarray
     if intrinsic.shape != (3, 3):
         raise ValueError(f"camera_matrix shape must be 3x3, got {intrinsic.shape}")
 
-    transform = extract_sensor_to_ego_transform(camera)
+    transform = convert_sensor_to_ego_transform_daq_to_target(extract_sensor_to_ego_transform(camera))
     sensor2ego_translation = transform[:3, 3].astype(np.float64)
     sensor2ego_rotation = matrix_to_quaternion_wxyz(transform[:3, :3])
     return intrinsic, sensor2ego_translation, sensor2ego_rotation
@@ -270,35 +348,71 @@ def steering_to_cmd(steering_rad: float, steering_thresh_deg: float) -> np.ndarr
 
 def build_cam_info(
     sample_dir: Path,
+    camera_type: str,
     camera_name: str,
     camera: dict[str, Any],
     lidar_to_vehicle: np.ndarray,
 ) -> dict[str, Any]:
     intrinsic, sensor2ego_translation, sensor2ego_rotation = extract_camera_entry(camera)
-    sensor2ego = extract_sensor_to_ego_transform(camera)
+    sensor2ego = convert_sensor_to_ego_transform_daq_to_target(extract_sensor_to_ego_transform(camera))
 
     lidar_to_vehicle = np.asarray(lidar_to_vehicle, dtype=np.float64)
     if lidar_to_vehicle.shape != (4, 4):
         raise ValueError(f"lidar_to_vehicle shape must be 4x4, got {lidar_to_vehicle.shape}")
 
+    lidar_to_vehicle = convert_transform_daq_to_ego(lidar_to_vehicle)
+
     sensor2lidar = np.linalg.inv(lidar_to_vehicle) @ sensor2ego
     sensor2lidar_translation = sensor2lidar[:3, 3].astype(np.float64)
     sensor2lidar_rotation = sensor2lidar[:3, :3].astype(np.float64)
+
+    pose = camera.get("pose", {})
+    ego_translation = np.asarray(pose.get("position", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+    ego_rotation_wxyz = np.asarray(pose.get("orientation", [1.0, 0.0, 0.0, 0.0]), dtype=np.float64).reshape(4)
+    ego_rotation_norm = float(np.linalg.norm(ego_rotation_wxyz))
+    if ego_rotation_norm > 0.0:
+        ego_rotation_wxyz = ego_rotation_wxyz / ego_rotation_norm
+    ego_rotation_wxyz = convert_ego_to_global_quaternion_daq_to_target(ego_rotation_wxyz)
+
     image_path = find_camera_image(sample_dir, camera_name)
     return {
         "data_path": str(image_path.resolve()),
+        "type": camera_type,
         "cam_intrinsic": intrinsic,
         "sensor2ego_translation": sensor2ego_translation.tolist(),
         "sensor2ego_rotation": sensor2ego_rotation.tolist(),
         "sensor2lidar_rotation": sensor2lidar_rotation.tolist(),
         "sensor2lidar_translation": sensor2lidar_translation.tolist(),
+        "ego2global_translation": ego_translation.tolist(),
+        "ego2global_rotation": ego_rotation_wxyz.tolist(),
     }
+
+
+def compute_ego_velocity_from_pose(
+    prev_position_global: np.ndarray | None,
+    prev_timestamp_ns: int | None,
+    curr_position_global: np.ndarray,
+    curr_rotation_wxyz: np.ndarray,
+    curr_timestamp_ns: int,
+) -> np.ndarray:
+    if prev_position_global is None or prev_timestamp_ns is None:
+        return np.zeros(3, dtype=np.float64)
+
+    dt = (curr_timestamp_ns - prev_timestamp_ns) / 1_000_000_000.0
+    if dt <= 0.0:
+        return np.zeros(3, dtype=np.float64)
+
+    velocity_global = (curr_position_global - prev_position_global) / dt
+    rotation_ego_to_global = quaternion_wxyz_to_matrix(curr_rotation_wxyz)
+    velocity_ego = rotation_ego_to_global.T @ velocity_global
+    return velocity_ego.astype(np.float64)
 
 
 def build_info(
     sample_dir: Path,
     frame_info: dict[str, Any],
     steering_rad: float,
+    ego_velocity: np.ndarray,
     sample_token: str,
     prev_token: str | None,
     next_token: str | None,
@@ -309,25 +423,29 @@ def build_info(
     cameras = frame_info.get("camera_calibration", {}).get("cameras", [])
     camera_by_name = {str(camera.get("name", "")): camera for camera in cameras}
 
-    front_camera = camera_by_name.get("FrontCam02_preproc")
-    if front_camera is None:
-        raise KeyError(f"缺少 FrontCam02_preproc 相机信息: {sample_dir}")
+    pose_camera = camera_by_name.get(EGO_POSE_CAMERA_NAME)
+    if pose_camera is None:
+        raise KeyError(f"缺少 {EGO_POSE_CAMERA_NAME} 相机信息: {sample_dir}")
 
-    front_timestamp_ns = int(front_camera.get("timestamp", 0))
-    timestamp_us = int(round(front_timestamp_ns / 1000.0))
+    anchor_timestamp_ns = int(pose_camera.get("timestamp", 0))
+    timestamp_us = int(round(anchor_timestamp_ns / 1000.0))
 
-    pose = front_camera.get("pose", {})
+    pose = pose_camera.get("pose", {})
     ego_translation = np.asarray(pose.get("position", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
     ego_rotation_wxyz = np.asarray(pose.get("orientation", [1.0, 0.0, 0.0, 0.0]), dtype=np.float64).reshape(4)
-    ego_rotation_wxyz = ego_rotation_wxyz / max(float(np.linalg.norm(ego_rotation_wxyz)), 1.0)
+    ego_rotation_norm = float(np.linalg.norm(ego_rotation_wxyz))
+    if ego_rotation_norm > 0.0:
+        ego_rotation_wxyz = ego_rotation_wxyz / ego_rotation_norm
+    ego_rotation_wxyz = convert_ego_to_global_quaternion_daq_to_target(ego_rotation_wxyz)
 
-    vc = np.asarray(front_camera.get("vc", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(3)
+    ego_velocity = np.asarray(ego_velocity, dtype=np.float32).reshape(3)
     ego_status = np.array(
-        [vc[0], vc[1], vc[2], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, steering_rad],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, ego_velocity[0], ego_velocity[1], ego_velocity[2], steering_rad],
         dtype=np.float32,
     )
 
-    lidar_translation, lidar_rotation_wxyz = matrix_to_translation_rotation(lidar_to_vehicle)
+    lidar_to_vehicle_target = convert_transform_daq_to_ego(lidar_to_vehicle)
+    lidar_translation, lidar_rotation_wxyz = matrix_to_translation_rotation(lidar_to_vehicle_target)
 
     lidar_path = find_single_file(sample_dir, "MainLidar01_demotion.pcd")
 
@@ -336,7 +454,13 @@ def build_info(
         camera = camera_by_name.get(camera_name)
         if camera is None:
             raise KeyError(f"缺少相机 {camera_name}: {sample_dir}")
-        cams[camera_key] = build_cam_info(sample_dir, camera_name, camera, lidar_to_vehicle)
+        cams[camera_key] = build_cam_info(
+            sample_dir,
+            camera_key,
+            camera_name,
+            camera,
+            lidar_to_vehicle,
+        )
 
     return {
         "token": sample_token,
@@ -396,6 +520,8 @@ def build_infos(root_dir: Path, steering_thresh_deg: float) -> list[dict[str, An
 
         scene_token = sample_dirs[0].name if scene_dir == root_dir else scene_dir.name
         prev_token: str | None = None
+        prev_position_global: np.ndarray | None = None
+        prev_timestamp_ns: int | None = None
 
         for index, sample_dir in enumerate(sample_dirs):
             sample_token = sample_dir.relative_to(root_dir).as_posix().replace("/", "_")
@@ -405,13 +531,32 @@ def build_infos(root_dir: Path, steering_thresh_deg: float) -> list[dict[str, An
                 else None
             )
             frame_info = load_relaxed_json(find_frame_info_path(sample_dir))
-            front_camera = next(
+            anchor_candidates = [
                 camera
                 for camera in frame_info.get("camera_calibration", {}).get("cameras", [])
-                if str(camera.get("name", "")) == "FrontCam02_preproc"
+                if str(camera.get("name", "")) == EGO_POSE_CAMERA_NAME
+            ]
+            if not anchor_candidates:
+                raise KeyError(f"缺少 {EGO_POSE_CAMERA_NAME} 相机信息: {sample_dir}")
+            anchor_camera = anchor_candidates[0]
+            anchor_timestamp_ns = int(anchor_camera.get("timestamp", 0))
+            anchor_pose = anchor_camera.get("pose", {})
+            curr_position_global = np.asarray(anchor_pose.get("position", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+            curr_rotation_wxyz = np.asarray(anchor_pose.get("orientation", [1.0, 0.0, 0.0, 0.0]), dtype=np.float64).reshape(4)
+            curr_rotation_norm = float(np.linalg.norm(curr_rotation_wxyz))
+            if curr_rotation_norm > 0.0:
+                curr_rotation_wxyz = curr_rotation_wxyz / curr_rotation_norm
+            curr_rotation_wxyz = convert_ego_to_global_quaternion_daq_to_target(curr_rotation_wxyz)
+
+            ego_velocity = compute_ego_velocity_from_pose(
+                prev_position_global=prev_position_global,
+                prev_timestamp_ns=prev_timestamp_ns,
+                curr_position_global=curr_position_global,
+                curr_rotation_wxyz=curr_rotation_wxyz,
+                curr_timestamp_ns=anchor_timestamp_ns,
             )
-            front_timestamp_ns = int(front_camera.get("timestamp", 0))
-            frame_timestamp_s = front_timestamp_ns / 1_000_000_000.0
+
+            frame_timestamp_s = anchor_timestamp_ns / 1_000_000_000.0
             steering_rad = nearest_can_value(can_series, frame_timestamp_s)
             if scene_dir == root_dir:
                 scene_token = sample_dirs[0].name
@@ -423,6 +568,7 @@ def build_infos(root_dir: Path, steering_thresh_deg: float) -> list[dict[str, An
                     sample_dir=sample_dir,
                     frame_info=frame_info,
                     steering_rad=steering_rad,
+                    ego_velocity=ego_velocity,
                     sample_token=sample_token,
                     prev_token=prev_token,
                     next_token=next_token,
@@ -431,6 +577,8 @@ def build_infos(root_dir: Path, steering_thresh_deg: float) -> list[dict[str, An
                     lidar_to_vehicle=lidar_to_vehicle,
                 )
             )
+            prev_position_global = curr_position_global
+            prev_timestamp_ns = anchor_timestamp_ns
             prev_token = sample_token
 
     return infos
