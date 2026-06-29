@@ -1,0 +1,95 @@
+{
+  "sampling": {
+    "timeline_stride_sec": 1,
+    "time_mode": "floor"
+  },
+  "thresholds": {
+    "det_score_thr": 0.25,
+    "map_score_thr": 0.25,
+    "max_salient_agents": 3,
+    "near_longitudinal_m": 2.0,
+    "lateral_side_m": 2.0,
+    "stationary_speed_mps": 0.3,
+    "slow_speed_mps": 2.0,
+    "fast_speed_mps": 6.0,
+    "dense_vehicle_count": 6,
+    "dense_vru_count": 4,
+    "ped_crossing_pedestrian_count": 2,
+    "crossing_scene_min_hits": 1,
+    "follow_vehicle_distance_m": 18.0,
+    "follow_traffic_min_hits": 2,
+    "follow_traffic_persistent_scene_count": 1,
+    "close_boundary_distance_m": 6.0,
+    "close_divider_distance_m": 6.0,
+    "boundary_narrowing_min_hits": 2,
+    "two_wheeler_front_distance_m": 15.0,
+    "two_wheeler_weaving_lateral_m": 4.0,
+    "two_wheeler_weaving_min_hits": 2,
+    "tracking_persistent_min_frames": 2,
+    "tracking_persistent_scene_count": 3
+  },
+  "groups": {
+    "vehicle_classes": [
+      "car",
+      "truck",
+      "construction_vehicle",
+      "bus",
+      "trailer"
+    ],
+    "vulnerable_classes": [
+      "pedestrian",
+      "bicycle",
+      "motorcycle"
+    ],
+    "two_wheeler_classes": [
+      "bicycle",
+      "motorcycle"
+    ]
+  },
+  "aliases": {
+    "det": {
+      "car": "car",
+      "truck": "truck",
+      "construction_vehicle": "construction vehicle",
+      "bus": "bus",
+      "trailer": "trailer",
+      "barrier": "barrier",
+      "motorcycle": "motorcycle",
+      "bicycle": "bicycle",
+      "pedestrian": "pedestrian",
+      "traffic_cone": "traffic cone"
+    },
+    "map": {
+      "ped_crossing": "pedestrian crossing",
+      "divider": "lane divider",
+      "boundary": "road boundary"
+    }
+  },
+  "templates": {
+    "counts_empty": "no significant agents",
+    "map_empty": "no significant map elements",
+    "timeline_counts": "Primary agents are {counts}",
+    "timeline_salient": "Notable agents include {salient}",
+    "timeline_map": "Map context: {map_text}",
+    "timeline_planning": "{planning}",
+    "gt_summary": "This scene is mainly composed of {counts}",
+    "pred_summary": "Model outputs suggest this scene mainly contains {counts}",
+    "summary_map": "Common map elements include {map_text}",
+    "summary_tracking": "There are {persistent_count} temporally persistent tracked agents",
+    "summary_tags": "Scene characteristics can be summarized as {tags}"
+  },
+  "scene_tags": {
+    "crossing_intersection": "intersection crossing",
+    "ped_crossing_pedestrian": "active pedestrians near crossing",
+    "ped_crossing_present": "pedestrian crossing ahead",
+    "follow_traffic": "follow-traffic driving",
+    "boundary_narrowing": "boundary narrowing",
+    "two_wheeler_weaving": "two-wheeler weaving",
+    "mixed_traffic": "mixed traffic with vehicles and two-wheelers",
+    "vehicle_dense": "dense motor traffic",
+    "vru_dense": "dense vulnerable road users",
+    "lane_structure": "clear lane and boundary structure",
+    "stable_tracking": "stable temporal tracking continuity",
+    "urban_default": "typical urban road traffic"
+  }
+}
