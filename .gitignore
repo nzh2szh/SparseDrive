@@ -11,11 +11,12 @@ dist_test/
 vis/
 val/
 lib/
+checkpoints/
 
 *.egg-info
-build/
+#build/
 __pycache__/
-*.so
+#*.so
 
 job_scripts/
 temp_ops/
