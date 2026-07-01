@@ -1,6 +1,6 @@
 {
   "sampling": {
-    "timeline_stride_sec": 3,
+    "timeline_stride_sec": 5,
     "time_mode": "floor"
   },
   "thresholds": {
