@@ -16,7 +16,7 @@
     "dense_vru_count": 4,
     "ped_crossing_pedestrian_count": 2,
     "crossing_scene_min_hits": 1,
-    "follow_vehicle_distance_m": 18.0,
+    "follow_vehicle_distance_m": 12.0,
     "follow_traffic_min_hits": 2,
     "follow_traffic_persistent_scene_count": 1,
     "close_boundary_distance_m": 6.0,
@@ -26,7 +26,21 @@
     "two_wheeler_weaving_lateral_m": 4.0,
     "two_wheeler_weaving_min_hits": 2,
     "tracking_persistent_min_frames": 2,
-    "tracking_persistent_scene_count": 3
+    "tracking_persistent_scene_count": 3,
+    "event_ego_start_speed_thr": 0.6,
+    "event_hard_brake_speed_drop": 0.6,
+    "event_lane_change_lateral_shift_m": 2.0,
+    "event_lane_change_min_forward_m": 3.0,
+    "event_u_turn_heading_deg": 130.0,
+    "event_follow_min_frames": 4,
+    "event_cut_in_out_lateral_band_m": 1.5,
+    "event_cut_in_enter_band_m": 1.0,
+    "event_cut_out_exit_band_m": 2.3,
+    "event_cut_min_lateral_shift_m": 1.2,
+    "event_cut_min_track_frames": 2,
+    "event_cut_confirm_frames": 2,
+    "event_cut_in_out_front_distance_m": 18.0,
+    "event_same_type_min_gap_sec": 4
   },
   "groups": {
     "vehicle_classes": [

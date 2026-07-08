@@ -62,6 +62,20 @@ DEFAULT_RULES = {
         "two_wheeler_weaving_min_hits": 2,
         "tracking_persistent_min_frames": 2,
         "tracking_persistent_scene_count": 3,
+        "event_ego_start_speed_thr": 0.8,
+        "event_hard_brake_speed_drop": 0.8,
+        "event_lane_change_lateral_shift_m": 2.5,
+        "event_lane_change_min_forward_m": 4.0,
+        "event_u_turn_heading_deg": 150.0,
+        "event_follow_min_frames": 2,
+        "event_cut_in_out_lateral_band_m": 1.5,
+        "event_cut_in_enter_band_m": 1.2,
+        "event_cut_out_exit_band_m": 2.0,
+        "event_cut_min_lateral_shift_m": 0.8,
+        "event_cut_min_track_frames": 3,
+        "event_cut_confirm_frames": 2,
+        "event_cut_in_out_front_distance_m": 25.0,
+        "event_same_type_min_gap_sec": 2,
     },
     "groups": {
         "vehicle_classes": [
@@ -418,6 +432,12 @@ def merge_timeline_descriptions(items):
     return " ".join(merged)
 
 
+def build_event_description(events):
+    if not events:
+        return ""
+    return " ".join(f"At t={item['t_sec']}s, {item['text']}." for item in events)
+
+
 def representative_indices(group, infos, rules):
     per_bucket = {}
     stride_sec = max(1, int(rules.get("sampling", {}).get("timeline_stride_sec", 1)))
@@ -472,12 +492,12 @@ def speed_phrase(speed_mps, rules):
     slow = threshold(rules, "slow_speed_mps", 2.0)
     fast = threshold(rules, "fast_speed_mps", 6.0)
     if speed_mps < stationary:
-        return "nearly stationary"
+        return "stationary"
     if speed_mps < slow:
-        return "moving slowly"
+        return "slow"
     if speed_mps < fast:
-        return "moving at normal speed"
-    return "moving fast"
+        return "normal"
+    return "fast"
 
 
 def summarize_counts(counter_obj, rules, alias_group):
@@ -498,18 +518,138 @@ def summarize_map_counter(counter_obj, rules):
 def format_agent_text(agent, rules):
     speed_value = agent.get("speed_mps")
     score_value = agent.get("score")
-    text = f"{agent['class_name']} at {agent['position']}, about {agent['distance_m']:.1f} m away"
+    text = f"{agent['class_name']} {agent['position']} {agent['distance_m']:.1f}m"
     if speed_value is not None:
-        text += f", {speed_phrase(speed_value, rules)}"
+        speed_text = speed_phrase(speed_value, rules)
+        if speed_text != "stationary":
+            text += f", {speed_text}"
     if score_value is not None:
-        text += f", score {score_value:.2f}"
+        text += f", s={score_value:.2f}"
     return text
 
 
 def summarize_map_elements(map_elements, rules):
     if not map_elements:
         return rules.get("templates", {}).get("map_empty", "no significant map elements")
-    return ", ".join(f"{item['class_name']} at {item['position']}" for item in map_elements[:3])
+    parts = []
+    for item in map_elements[:3]:
+        text = f"{item['class_name']} {item['position']}"
+        shape_text = item.get("shape_text")
+        if shape_text:
+            text += f", {shape_text}"
+        parts.append(text)
+    return ", ".join(parts)
+
+
+def natural_position_phrase(position):
+    replacements = {
+        "front": "ahead",
+        "rear": "behind",
+        "left front": "ahead on the left",
+        "right front": "ahead on the right",
+        "left rear": "behind on the left",
+        "right rear": "behind on the right",
+        "near left side": "on the left",
+        "near right side": "on the right",
+        "near ego vehicle": "nearby",
+        "center": "ahead",
+    }
+    return replacements.get(str(position), str(position))
+
+
+def format_event_agent_text(agent, rules):
+    speed_value = agent.get("speed_mps")
+    speed_text = ""
+    if speed_value is not None:
+        speed = speed_phrase(speed_value, rules)
+        if speed != "stationary":
+            speed_text = f"{speed} "
+    position_text = natural_position_phrase(agent.get("position"))
+    return f"a {speed_text}{agent['class_name']} {agent['distance_m']:.1f}m {position_text}"
+
+
+def format_event_map_text(item):
+    position_text = natural_position_phrase(item.get("position"))
+    shape_text = item.get("shape_text")
+    if shape_text:
+        shape_parts = str(shape_text).split("/")
+        if len(shape_parts) == 3:
+            shape_text = f"{shape_parts[0]}, {shape_parts[2]}"
+    if shape_text:
+        return f"a {shape_text} {item['class_name']} {position_text}"
+    return f"a {item['class_name']} {position_text}"
+
+
+def join_natural_phrases(items):
+    items = [str(item).strip() for item in items if str(item).strip()]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def polyline_shape_text(points):
+    points = to_numpy(points)
+    if points is None or np.asarray(points).size == 0:
+        return None
+    points = np.asarray(points)
+    if points.ndim == 1:
+        points = points.reshape(-1, 2)
+    if points.shape[0] < 2 or points.shape[1] < 2:
+        return None
+    points = points[:, :2]
+    deltas = np.diff(points, axis=0)
+    segment_lengths = np.sqrt(np.square(deltas[:, 0]) + np.square(deltas[:, 1]))
+    length_m = float(np.sum(segment_lengths))
+    direct_dx = safe_float(points[-1, 0] - points[0, 0])
+    direct_dy = safe_float(points[-1, 1] - points[0, 1])
+    direct_m = compute_distance(direct_dx, direct_dy)
+    shape = "curved" if direct_m > 1e-3 and length_m / direct_m > 1.15 else "straight"
+
+    if abs(direct_dx) >= abs(direct_dy) * 1.5:
+        orientation = "longitudinal"
+    elif abs(direct_dy) >= abs(direct_dx) * 1.5:
+        orientation = "lateral"
+    else:
+        orientation = "diagonal"
+    return f"{shape}/{orientation}/{length_m:.1f}m"
+
+
+def build_event_context_text(agent_counts, salient_agents, map_elements, rules):
+    segments = []
+    if salient_agents:
+        segments.extend(format_event_agent_text(agent, rules) for agent in salient_agents)
+    elif agent_counts:
+        segments.append(summarize_counts(agent_counts, rules, "det"))
+
+    if map_elements:
+        segments.extend(format_event_map_text(item) for item in map_elements[:2])
+
+    if not segments:
+        return ""
+    return f"with {join_natural_phrases(segments)}"
+
+
+def append_event_context(text, context_text):
+    context_text = str(context_text or "").strip()
+    if not context_text:
+        return text
+    return f"{text}, {context_text}"
+
+
+def build_gt_event_context(info, rules):
+    agent_counts, salient_agents = extract_agents_from_gt(info, rules)
+    map_elements = extract_map_from_gt(info.get("map_annos"), rules)
+    return build_event_context_text(agent_counts, salient_agents, map_elements, rules)
+
+
+def build_pred_event_context(img_bbox, rules):
+    agent_counts, salient_agents = extract_agents_from_pred(img_bbox, rules)
+    map_elements = extract_map_from_pred(img_bbox, rules)
+    return build_event_context_text(agent_counts, salient_agents, map_elements, rules)
 
 
 def build_timeline_description(agent_counts, salient_agents, map_elements, rules, planning_text=None):
@@ -616,6 +756,7 @@ def extract_map_from_gt(map_annos, rules):
             continue
         best_distance = None
         best_position = "near ego vehicle"
+        best_shape_text = None
         for polyline in polylines:
             points = to_numpy(polyline)
             if points is None or points.size == 0:
@@ -629,6 +770,7 @@ def extract_map_from_gt(map_annos, rules):
             if best_distance is None or distance < best_distance:
                 best_distance = distance
                 best_position = position_phrase(points[min_index, 0], points[min_index, 1], rules)
+                best_shape_text = polyline_shape_text(points)
         elements.append(
             {
                 "raw_class_name": normalized_class_name,
@@ -636,6 +778,7 @@ def extract_map_from_gt(map_annos, rules):
                 "count": len(polylines),
                 "position": best_position,
                 "distance_m": best_distance,
+                "shape_text": best_shape_text,
             }
         )
     return sorted(elements, key=lambda item: (item["distance_m"] is None, item["distance_m"] or 0.0))[:3]
@@ -760,6 +903,7 @@ def extract_map_from_pred(img_bbox, rules):
                 "class_name": alias_name(raw_class_name, rules, "map"),
                 "position": position_phrase(points[min_index, 0], points[min_index, 1], rules),
                 "distance_m": float(distances[min_index]),
+                "shape_text": polyline_shape_text(points),
                 "score": score,
             }
         )
@@ -779,6 +923,595 @@ def extract_planning_text(img_bbox, rules):
     end_x = safe_float(endpoint[0])
     end_y = safe_float(endpoint[1])
     return f"Planned ego endpoint is around {position_phrase(end_x, end_y, rules)}, about {compute_distance(end_x, end_y):.1f} m away"
+
+
+def extract_planning_points(img_bbox):
+    planning = to_numpy(img_bbox.get("final_planning"))
+    if planning is None:
+        planning = to_numpy(img_bbox.get("planning"))
+    if planning is None:
+        return None
+
+    planning = np.asarray(planning)
+    if planning.size == 0:
+        return None
+
+    while planning.ndim > 2:
+        planning = planning[0]
+    if planning.ndim == 1:
+        if planning.size < 2:
+            return None
+        planning = planning.reshape(-1, 2)
+
+    if planning.ndim != 2 or planning.shape[0] < 2:
+        return None
+    if planning.shape[1] < 2:
+        return None
+    if planning.shape[1] > 2:
+        planning = planning[:, :2]
+    return planning.astype(np.float32)
+
+
+def planning_state_from_img_bbox(img_bbox):
+    points = extract_planning_points(img_bbox)
+    if points is None:
+        return None
+
+    head_count = min(len(points), 4)
+    head_points = points[:head_count]
+    step = np.diff(head_points, axis=0)
+    step_norm = np.sqrt(np.square(step[:, 0]) + np.square(step[:, 1])) if len(step) > 0 else np.array([0.0])
+    speed_proxy = float(np.mean(step_norm))
+
+    end_point = points[-1]
+    direction = end_point - points[0]
+    heading_rad = None
+    if float(np.hypot(direction[0], direction[1])) > 1e-3:
+        heading_rad = float(math.atan2(direction[1], direction[0]))
+
+    return {
+        "speed_proxy": speed_proxy,
+        "end_x": safe_float(end_point[0]),
+        "end_y": safe_float(end_point[1]),
+        "endpoint_dist": compute_distance(end_point[0], end_point[1]),
+        "heading_rad": heading_rad,
+    }
+
+
+def normalize_angle_rad(angle):
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def relative_t_sec(info, scene_start_timestamp):
+    return int(math.floor(max(0.0, (info["timestamp"] - scene_start_timestamp) / 1e6)))
+
+
+def quaternion_yaw(rotation):
+    quat = to_numpy(rotation)
+    if quat is None or np.asarray(quat).size < 4:
+        return None
+    quat = np.asarray(quat).reshape(-1)
+    w, x_coord, y_coord, z_coord = [safe_float(value) for value in quat[:4]]
+    siny_cosp = 2.0 * (w * z_coord + x_coord * y_coord)
+    cosy_cosp = 1.0 - 2.0 * (y_coord * y_coord + z_coord * z_coord)
+    return float(math.atan2(siny_cosp, cosy_cosp))
+
+
+def gt_ego_motion_state(prev_info, curr_info):
+    prev_translation = to_numpy(prev_info.get("ego2global_translation"))
+    curr_translation = to_numpy(curr_info.get("ego2global_translation"))
+    if prev_translation is None or curr_translation is None:
+        return None
+    prev_translation = np.asarray(prev_translation).reshape(-1)
+    curr_translation = np.asarray(curr_translation).reshape(-1)
+    if prev_translation.size < 2 or curr_translation.size < 2:
+        return None
+
+    dt_sec = (curr_info["timestamp"] - prev_info["timestamp"]) / 1e6
+    if dt_sec <= 1e-3:
+        return None
+
+    dx_global = safe_float(curr_translation[0] - prev_translation[0])
+    dy_global = safe_float(curr_translation[1] - prev_translation[1])
+    distance_m = compute_distance(dx_global, dy_global)
+    prev_yaw = quaternion_yaw(prev_info.get("ego2global_rotation"))
+    curr_yaw = quaternion_yaw(curr_info.get("ego2global_rotation"))
+    if prev_yaw is None:
+        prev_yaw = math.atan2(dy_global, dx_global) if distance_m > 1e-3 else 0.0
+
+    cos_yaw = math.cos(prev_yaw)
+    sin_yaw = math.sin(prev_yaw)
+    forward_m = dx_global * cos_yaw + dy_global * sin_yaw
+    lateral_m = -dx_global * sin_yaw + dy_global * cos_yaw
+    heading_delta_deg = None
+    if curr_yaw is not None:
+        heading_delta_deg = abs(normalize_angle_rad(curr_yaw - prev_yaw)) * 180.0 / math.pi
+
+    return {
+        "speed_mps": distance_m / dt_sec,
+        "forward_m": forward_m,
+        "lateral_m": lateral_m,
+        "yaw_rad": curr_yaw,
+        "heading_delta_deg": heading_delta_deg,
+    }
+
+
+def update_cut_track_state(prev_state, y_coord, rules):
+    cut_min_lateral_shift = float(threshold(rules, "event_cut_min_lateral_shift_m", 0.8))
+    min_track_frames = int(threshold(rules, "event_cut_min_track_frames", 3))
+    confirm_frames = int(threshold(rules, "event_cut_confirm_frames", 2))
+
+    if prev_state is None:
+        return {
+            "in_lane_center": cut_lane_center_state(y_coord, False, rules),
+            "anchor_y": y_coord,
+            "age": 1,
+            "pending_state": None,
+            "pending_count": 0,
+        }, None
+
+    age = int(prev_state.get("age", 0)) + 1
+    prev_in_center = bool(prev_state.get("in_lane_center", False))
+    prev_anchor_y = safe_float(prev_state.get("anchor_y", y_coord))
+    candidate_center = cut_lane_center_state(y_coord, prev_in_center, rules)
+    lateral_shift = abs(y_coord - prev_anchor_y)
+    abs_delta = abs(y_coord) - abs(prev_anchor_y)
+
+    new_state = dict(prev_state)
+    new_state["age"] = age
+
+    if candidate_center == prev_in_center:
+        new_state["pending_state"] = None
+        new_state["pending_count"] = 0
+        return new_state, None
+
+    if age < min_track_frames or lateral_shift < cut_min_lateral_shift:
+        new_state["pending_state"] = None
+        new_state["pending_count"] = 0
+        return new_state, None
+
+    if candidate_center and abs_delta > -cut_min_lateral_shift:
+        return new_state, None
+    if not candidate_center and abs_delta < cut_min_lateral_shift:
+        return new_state, None
+
+    pending_state = new_state.get("pending_state")
+    pending_count = int(new_state.get("pending_count", 0))
+    if pending_state == candidate_center:
+        pending_count += 1
+    else:
+        pending_state = candidate_center
+        pending_count = 1
+
+    new_state["pending_state"] = pending_state
+    new_state["pending_count"] = pending_count
+    if pending_count < confirm_frames:
+        return new_state, None
+
+    new_state["in_lane_center"] = candidate_center
+    new_state["anchor_y"] = y_coord
+    new_state["pending_state"] = None
+    new_state["pending_count"] = 0
+    return new_state, "cut_in" if candidate_center else "cut_out"
+
+
+def extract_lead_vehicle_distance_from_pred(img_bbox, rules):
+    boxes = decode_pred_boxes(img_bbox.get("boxes_3d"))
+    scores = to_numpy(img_bbox.get("scores_3d"))
+    labels = to_numpy(img_bbox.get("labels_3d"))
+    if scores is None or labels is None or boxes.size == 0:
+        return None
+
+    det_score_thr = float(threshold(rules, "det_score_thr", 0.25))
+    vehicle_classes = set(rules.get("groups", {}).get("vehicle_classes", []))
+
+    scores = np.asarray(scores).reshape(-1)
+    labels = np.asarray(labels).reshape(-1)
+    lead_distance = None
+    count = min(len(scores), len(labels), len(boxes))
+    for index in range(count):
+        score = safe_float(scores[index])
+        if score < det_score_thr:
+            continue
+        label_index = int(labels[index])
+        raw_class_name = DET_CLASS_NAMES[label_index] if 0 <= label_index < len(DET_CLASS_NAMES) else f"class_{label_index}"
+        if raw_class_name not in vehicle_classes:
+            continue
+        box = boxes[index]
+        x_coord = safe_float(box[0]) if len(box) > 0 else 0.0
+        y_coord = safe_float(box[1]) if len(box) > 1 else 0.0
+        if x_coord <= 0.0:
+            continue
+        distance_m = compute_distance(x_coord, y_coord)
+        if lead_distance is None or distance_m < lead_distance:
+            lead_distance = distance_m
+    return lead_distance
+
+
+def extract_vehicle_tracks_from_pred(img_bbox, rules):
+    boxes = decode_pred_boxes(img_bbox.get("boxes_3d"))
+    scores = to_numpy(img_bbox.get("scores_3d"))
+    labels = to_numpy(img_bbox.get("labels_3d"))
+    instance_ids = to_numpy(img_bbox.get("instance_ids"))
+    if scores is None or labels is None or instance_ids is None or boxes.size == 0:
+        return []
+
+    det_score_thr = float(threshold(rules, "det_score_thr", 0.25))
+    front_distance_limit = float(threshold(rules, "event_cut_in_out_front_distance_m", 25.0))
+    vehicle_classes = set(rules.get("groups", {}).get("vehicle_classes", []))
+
+    scores = np.asarray(scores).reshape(-1)
+    labels = np.asarray(labels).reshape(-1)
+    instance_ids = np.asarray(instance_ids).reshape(-1)
+
+    tracks = []
+    count = min(len(scores), len(labels), len(instance_ids), len(boxes))
+    for index in range(count):
+        score = safe_float(scores[index])
+        if score < det_score_thr:
+            continue
+        label_index = int(labels[index])
+        raw_class_name = DET_CLASS_NAMES[label_index] if 0 <= label_index < len(DET_CLASS_NAMES) else f"class_{label_index}"
+        if raw_class_name not in vehicle_classes:
+            continue
+        box = boxes[index]
+        x_coord = safe_float(box[0]) if len(box) > 0 else 0.0
+        y_coord = safe_float(box[1]) if len(box) > 1 else 0.0
+        if x_coord <= 0.0:
+            continue
+        distance_m = compute_distance(x_coord, y_coord)
+        if distance_m > front_distance_limit:
+            continue
+        tracks.append(
+            {
+                "instance_id": str(instance_ids[index]),
+                "x_coord": x_coord,
+                "y_coord": y_coord,
+                "distance_m": distance_m,
+            }
+        )
+    return tracks
+
+
+def planning_state_from_gt_info(info):
+    ego_trajs = to_numpy(info.get("gt_ego_fut_trajs"))
+    if ego_trajs is None:
+        return None
+    ego_trajs = np.asarray(ego_trajs)
+    if ego_trajs.size == 0:
+        return None
+    if ego_trajs.ndim == 1:
+        if ego_trajs.size < 2:
+            return None
+        ego_trajs = ego_trajs.reshape(-1, 2)
+    if ego_trajs.ndim != 2 or ego_trajs.shape[1] < 2:
+        return None
+
+    ego_masks = to_numpy(info.get("gt_ego_fut_masks"))
+    if ego_masks is not None:
+        ego_masks = np.asarray(ego_masks).reshape(-1)
+        valid_len = int(np.sum(ego_masks > 0.5))
+        if valid_len > 0:
+            ego_trajs = ego_trajs[:valid_len]
+    if len(ego_trajs) < 2:
+        return None
+
+    points = np.cumsum(ego_trajs[:, :2], axis=0)
+    head_count = min(len(points), 4)
+    head_points = points[:head_count]
+    step = np.diff(head_points, axis=0)
+    step_norm = np.sqrt(np.square(step[:, 0]) + np.square(step[:, 1])) if len(step) > 0 else np.array([0.0])
+    speed_proxy = float(np.mean(step_norm))
+
+    end_point = points[-1]
+    direction = end_point - points[0]
+    heading_rad = None
+    if float(np.hypot(direction[0], direction[1])) > 1e-3:
+        heading_rad = float(math.atan2(direction[1], direction[0]))
+
+    return {
+        "speed_proxy": speed_proxy,
+        "end_x": safe_float(end_point[0]),
+        "end_y": safe_float(end_point[1]),
+        "endpoint_dist": compute_distance(end_point[0], end_point[1]),
+        "heading_rad": heading_rad,
+    }
+
+
+def extract_lead_vehicle_distance_from_gt(info, rules):
+    boxes = to_numpy(info.get("gt_boxes"))
+    names = info.get("gt_names")
+    if boxes is None or names is None:
+        return None
+
+    boxes = np.asarray(boxes)
+    names = list(np.asarray(names).tolist())
+    if boxes.ndim == 1:
+        boxes = boxes.reshape(1, -1)
+
+    vehicle_classes = set(rules.get("groups", {}).get("vehicle_classes", []))
+    lead_distance = None
+    count = min(len(boxes), len(names))
+    for index in range(count):
+        raw_class_name = str(names[index])
+        if raw_class_name not in vehicle_classes:
+            continue
+        box = boxes[index]
+        x_coord = safe_float(box[0]) if len(box) > 0 else 0.0
+        y_coord = safe_float(box[1]) if len(box) > 1 else 0.0
+        if x_coord <= 0.0:
+            continue
+        distance_m = compute_distance(x_coord, y_coord)
+        if lead_distance is None or distance_m < lead_distance:
+            lead_distance = distance_m
+    return lead_distance
+
+
+def extract_vehicle_tracks_from_gt(info, rules):
+    boxes = to_numpy(info.get("gt_boxes"))
+    names = info.get("gt_names")
+    instance_inds = info.get("instance_inds")
+    if boxes is None or names is None or instance_inds is None:
+        return []
+
+    boxes = np.asarray(boxes)
+    names = list(np.asarray(names).tolist())
+    instance_inds = list(np.asarray(instance_inds).tolist())
+    if boxes.ndim == 1:
+        boxes = boxes.reshape(1, -1)
+
+    vehicle_classes = set(rules.get("groups", {}).get("vehicle_classes", []))
+    front_distance_limit = float(threshold(rules, "event_cut_in_out_front_distance_m", 25.0))
+
+    tracks = []
+    count = min(len(boxes), len(names), len(instance_inds))
+    for index in range(count):
+        raw_class_name = str(names[index])
+        if raw_class_name not in vehicle_classes:
+            continue
+        box = boxes[index]
+        x_coord = safe_float(box[0]) if len(box) > 0 else 0.0
+        y_coord = safe_float(box[1]) if len(box) > 1 else 0.0
+        if x_coord <= 0.0:
+            continue
+        distance_m = compute_distance(x_coord, y_coord)
+        if distance_m > front_distance_limit:
+            continue
+        tracks.append(
+            {
+                "instance_id": str(instance_inds[index]),
+                "x_coord": x_coord,
+                "y_coord": y_coord,
+                "distance_m": distance_m,
+            }
+        )
+    return tracks
+
+
+def cut_lane_center_state(y_coord, prev_in_center, rules):
+    legacy_band = float(threshold(rules, "event_cut_in_out_lateral_band_m", 1.5))
+    enter_band = float(threshold(rules, "event_cut_in_enter_band_m", min(legacy_band, 1.2)))
+    exit_band = float(threshold(rules, "event_cut_out_exit_band_m", max(legacy_band, enter_band)))
+    if exit_band < enter_band:
+        exit_band = enter_band
+
+    abs_y = abs(safe_float(y_coord))
+    if prev_in_center:
+        return abs_y <= exit_band
+    return abs_y <= enter_band
+
+
+def detect_gt_scene_events(group, infos, rules):
+    events = []
+    last_type_t = {}
+    last_cut_event_frame = {}
+    prev_lane_state = {}
+    prev_ego_speed = None
+    ego_motion_history = []
+    follow_run = 0
+    follow_announced = False
+    current_event_context_text = ""
+
+    start_speed_thr = float(threshold(rules, "event_ego_start_speed_thr", 0.8))
+    hard_brake_drop = float(threshold(rules, "event_hard_brake_speed_drop", 0.8))
+    lane_change_lateral = float(threshold(rules, "event_lane_change_lateral_shift_m", 2.5))
+    lane_change_forward = float(threshold(rules, "event_lane_change_min_forward_m", 4.0))
+    u_turn_heading_deg = float(threshold(rules, "event_u_turn_heading_deg", 150.0))
+    follow_distance = float(threshold(rules, "follow_vehicle_distance_m", 18.0))
+    follow_min_frames = int(threshold(rules, "event_follow_min_frames", 2))
+    same_type_min_gap = int(threshold(rules, "event_same_type_min_gap_sec", 2))
+
+    def maybe_add_event(event_type, t_sec, text, dedupe_key=None, frame_index=None):
+        key = dedupe_key or event_type
+        if key in last_type_t and t_sec - last_type_t[key] < same_type_min_gap:
+            return
+        if frame_index is not None:
+            prev_frame = last_cut_event_frame.get(key)
+            if prev_frame is not None and frame_index - prev_frame < 2:
+                return
+            last_cut_event_frame[key] = frame_index
+        last_type_t[key] = t_sec
+        text = append_event_context(text, current_event_context_text)
+        events.append({"t_sec": t_sec, "event_type": event_type, "text": text})
+
+    for frame_index in range(group["start_index"], group["end_index"] + 1):
+        info = infos[frame_index]
+        t_sec = relative_t_sec(info, group["start_timestamp"])
+        current_event_context_text = build_gt_event_context(info, rules)
+
+        ego_motion = None
+        if frame_index > group["start_index"]:
+            ego_motion = gt_ego_motion_state(infos[frame_index - 1], info)
+        if ego_motion is not None:
+            ego_speed = ego_motion["speed_mps"]
+            if prev_ego_speed is not None:
+                if (
+                    prev_ego_speed - ego_speed >= hard_brake_drop
+                    and prev_ego_speed >= start_speed_thr
+                    and ego_speed <= max(start_speed_thr, prev_ego_speed * 0.6)
+                ):
+                    maybe_add_event("ego_hard_brake", t_sec, "ego vehicle performs hard braking (approx)")
+
+                stationary_speed = float(threshold(rules, "stationary_speed_mps", 0.3))
+                if prev_ego_speed <= stationary_speed and ego_speed >= start_speed_thr:
+                    maybe_add_event("ego_start", t_sec, "ego vehicle starts moving (approx)")
+
+            prev_ego_speed = ego_speed
+            ego_motion_history.append(ego_motion)
+            ego_motion_history = ego_motion_history[-6:]
+
+            lateral_sum = sum(item["lateral_m"] for item in ego_motion_history)
+            forward_sum = sum(max(0.0, item["forward_m"]) for item in ego_motion_history)
+            heading_sum = sum(item["heading_delta_deg"] or 0.0 for item in ego_motion_history)
+            if (
+                abs(lateral_sum) >= lane_change_lateral
+                and forward_sum >= lane_change_forward
+                and heading_sum <= 45.0
+            ):
+                direction = "to the left" if lateral_sum > 0.0 else "to the right"
+                maybe_add_event("ego_lane_change", t_sec, f"ego vehicle changes lane {direction} (approx)")
+                ego_motion_history = []
+
+            if heading_sum >= u_turn_heading_deg and forward_sum >= lane_change_forward:
+                maybe_add_event("ego_u_turn", t_sec, "ego vehicle performs a U-turn (approx)")
+                ego_motion_history = []
+
+        lead_distance = extract_lead_vehicle_distance_from_gt(info, rules)
+        if lead_distance is not None and lead_distance <= follow_distance:
+            follow_run += 1
+            if follow_run >= follow_min_frames and not follow_announced:
+                maybe_add_event("ego_follow", t_sec, "ego vehicle follows a lead vehicle (approx)")
+                follow_announced = True
+        else:
+            follow_run = 0
+            follow_announced = False
+
+        tracks = extract_vehicle_tracks_from_gt(info, rules)
+        for track in tracks:
+            instance_id = track["instance_id"]
+            y_coord = safe_float(track["y_coord"])
+            prev_state = prev_lane_state.get(instance_id)
+            new_state, cut_event = update_cut_track_state(prev_state, y_coord, rules)
+            prev_lane_state[instance_id] = new_state
+            if cut_event == "cut_in":
+                maybe_add_event(
+                    "other_cut_in",
+                    t_sec,
+                    f"a surrounding vehicle (id={instance_id}) cuts in (approx)",
+                    dedupe_key=f"other_cut_in:{instance_id}",
+                    frame_index=frame_index,
+                )
+            elif cut_event == "cut_out":
+                maybe_add_event(
+                    "other_cut_out",
+                    t_sec,
+                    f"a surrounding vehicle (id={instance_id}) cuts out (approx)",
+                    dedupe_key=f"other_cut_out:{instance_id}",
+                    frame_index=frame_index,
+                )
+
+    return sorted(events, key=lambda item: (item["t_sec"], item["event_type"]))
+
+
+def detect_pred_scene_events(group, infos, results, rules):
+    events = []
+    last_type_t = {}
+    last_cut_event_frame = {}
+    prev_lane_state = {}
+    prev_plan_state = None
+    follow_run = 0
+    follow_announced = False
+    current_event_context_text = ""
+
+    start_speed_thr = float(threshold(rules, "event_ego_start_speed_thr", 0.8))
+    hard_brake_drop = float(threshold(rules, "event_hard_brake_speed_drop", 0.8))
+    lane_change_lateral = float(threshold(rules, "event_lane_change_lateral_shift_m", 2.5))
+    lane_change_forward = float(threshold(rules, "event_lane_change_min_forward_m", 4.0))
+    u_turn_heading_deg = float(threshold(rules, "event_u_turn_heading_deg", 150.0))
+    follow_distance = float(threshold(rules, "follow_vehicle_distance_m", 18.0))
+    follow_min_frames = int(threshold(rules, "event_follow_min_frames", 2))
+    same_type_min_gap = int(threshold(rules, "event_same_type_min_gap_sec", 2))
+
+    def maybe_add_event(event_type, t_sec, text, dedupe_key=None, frame_index=None):
+        key = dedupe_key or event_type
+        if key in last_type_t and t_sec - last_type_t[key] < same_type_min_gap:
+            return
+        if frame_index is not None:
+            prev_frame = last_cut_event_frame.get(key)
+            if prev_frame is not None and frame_index - prev_frame < 2:
+                return
+            last_cut_event_frame[key] = frame_index
+        last_type_t[key] = t_sec
+        text = append_event_context(text, current_event_context_text)
+        events.append({"t_sec": t_sec, "event_type": event_type, "text": text})
+
+    for frame_index in range(group["start_index"], group["end_index"] + 1):
+        info = infos[frame_index]
+        img_bbox = results[frame_index].get("img_bbox", {})
+        t_sec = relative_t_sec(info, group["start_timestamp"])
+        current_event_context_text = build_pred_event_context(img_bbox, rules)
+
+        plan_state = planning_state_from_img_bbox(img_bbox)
+        if plan_state is not None and prev_plan_state is not None:
+            if (
+                prev_plan_state["speed_proxy"] - plan_state["speed_proxy"] >= hard_brake_drop
+                and prev_plan_state["speed_proxy"] >= start_speed_thr
+            ):
+                maybe_add_event("ego_hard_brake", t_sec, "ego vehicle performs hard braking")
+
+            if prev_plan_state["speed_proxy"] < start_speed_thr <= plan_state["speed_proxy"]:
+                maybe_add_event("ego_start", t_sec, "ego vehicle starts moving")
+
+            lateral_shift = abs(plan_state["end_y"] - prev_plan_state["end_y"])
+            if lateral_shift >= lane_change_lateral and max(plan_state["end_x"], prev_plan_state["end_x"]) >= lane_change_forward:
+                direction = "to the left" if plan_state["end_y"] > prev_plan_state["end_y"] else "to the right"
+                maybe_add_event("ego_lane_change", t_sec, f"ego vehicle changes lane {direction}")
+
+            prev_heading = prev_plan_state.get("heading_rad")
+            curr_heading = plan_state.get("heading_rad")
+            if prev_heading is not None and curr_heading is not None and plan_state["endpoint_dist"] >= lane_change_forward:
+                delta_heading = abs(normalize_angle_rad(curr_heading - prev_heading)) * 180.0 / math.pi
+                if delta_heading >= u_turn_heading_deg:
+                    maybe_add_event("ego_u_turn", t_sec, "ego vehicle performs a U-turn")
+
+        if plan_state is not None:
+            prev_plan_state = plan_state
+
+        lead_distance = extract_lead_vehicle_distance_from_pred(img_bbox, rules)
+        if lead_distance is not None and lead_distance <= follow_distance:
+            follow_run += 1
+            if follow_run >= follow_min_frames and not follow_announced:
+                maybe_add_event("ego_follow", t_sec, "ego vehicle follows a lead vehicle")
+                follow_announced = True
+        else:
+            follow_run = 0
+            follow_announced = False
+
+        tracks = extract_vehicle_tracks_from_pred(img_bbox, rules)
+        for track in tracks:
+            instance_id = track["instance_id"]
+            y_coord = safe_float(track["y_coord"])
+            prev_state = prev_lane_state.get(instance_id)
+            new_state, cut_event = update_cut_track_state(prev_state, y_coord, rules)
+            prev_lane_state[instance_id] = new_state
+            if cut_event == "cut_in":
+                maybe_add_event(
+                    "other_cut_in",
+                    t_sec,
+                    f"a surrounding vehicle (id={instance_id}) cuts in",
+                    dedupe_key=f"other_cut_in:{instance_id}",
+                    frame_index=frame_index,
+                )
+            elif cut_event == "cut_out":
+                maybe_add_event(
+                    "other_cut_out",
+                    t_sec,
+                    f"a surrounding vehicle (id={instance_id}) cuts out",
+                    dedupe_key=f"other_cut_out:{instance_id}",
+                    frame_index=frame_index,
+                )
+
+    return sorted(events, key=lambda item: (item["t_sec"], item["event_type"]))
 
 
 def derive_scene_tags(agent_counter, map_counter, persistent_count, scene_stats, rules):
@@ -864,13 +1597,12 @@ def build_scene_summary(source_type, aggregate_counts, aggregate_map, persistent
 
 
 def build_gt_scene_record(group, infos, rules):
-    timeline_descriptions = []
     aggregate_counts = Counter()
     aggregate_map = Counter()
     scene_stats = init_scene_stats()
     errors = []
 
-    for t_sec, index in representative_indices(group, infos, rules):
+    for _, index in representative_indices(group, infos, rules):
         info = infos[index]
         try:
             agent_counts, salient_agents = extract_agents_from_gt(info, rules)
@@ -880,23 +1612,19 @@ def build_gt_scene_record(group, infos, rules):
             for item in map_elements:
                 aggregate_map[item["raw_class_name"]] += item.get("count", 1)
             update_scene_stats(scene_stats, agent_counts, salient_agents, map_elements, rules)
-            timeline_descriptions.append(
-                {
-                    "t_sec": t_sec,
-                    "description": build_timeline_description(agent_counts, salient_agents, map_elements, rules),
-                }
-            )
         except Exception as exc:
             errors.append(f"sample_index={index}: {exc}")
 
     summary, scene_tags = build_scene_summary("gt", aggregate_counts, aggregate_map, 0, scene_stats, rules)
+    events = detect_gt_scene_events(group, infos, rules)
     return {
         "scene_token": group["scene_token"],
         "start_timestamp": group["start_timestamp"],
         "start_index": group["start_index"],
         "end_index": group["end_index"],
         "summary": summary,
-        "description": merge_timeline_descriptions(timeline_descriptions),
+        "description": build_event_description(events),
+        "scene_events": events,
         "scene_tags": scene_tags,
         "scene_stats": scene_stats,
         "errors": errors,
@@ -904,19 +1632,17 @@ def build_gt_scene_record(group, infos, rules):
 
 
 def build_pred_scene_record(group, infos, results, rules):
-    timeline_descriptions = []
     aggregate_counts = Counter()
     aggregate_map = Counter()
     instance_counter = Counter()
     scene_stats = init_scene_stats()
     errors = []
 
-    for t_sec, index in representative_indices(group, infos, rules):
+    for _, index in representative_indices(group, infos, rules):
         try:
             img_bbox = results[index].get("img_bbox", {})
             agent_counts, salient_agents = extract_agents_from_pred(img_bbox, rules)
             map_elements = extract_map_from_pred(img_bbox, rules)
-            planning_text = extract_planning_text(img_bbox, rules)
             for name, count in agent_counts.items():
                 aggregate_counts[name] += count
             for item in map_elements:
@@ -927,19 +1653,6 @@ def build_pred_scene_record(group, infos, results, rules):
             if instance_ids is not None:
                 for instance_id in np.asarray(instance_ids).reshape(-1).tolist():
                     instance_counter[str(instance_id)] += 1
-
-            timeline_descriptions.append(
-                {
-                    "t_sec": t_sec,
-                    "description": build_timeline_description(
-                        agent_counts,
-                        salient_agents,
-                        map_elements,
-                        rules,
-                        planning_text=planning_text,
-                    ),
-                }
-            )
         except Exception as exc:
             errors.append(f"sample_index={index}: {exc}")
 
@@ -948,13 +1661,15 @@ def build_pred_scene_record(group, infos, results, rules):
         if count >= threshold(rules, "tracking_persistent_min_frames", 2)
     )
     summary, scene_tags = build_scene_summary("pred", aggregate_counts, aggregate_map, persistent_count, scene_stats, rules)
+    events = detect_pred_scene_events(group, infos, results, rules)
     return {
         "scene_token": group["scene_token"],
         "start_timestamp": group["start_timestamp"],
         "start_index": group["start_index"],
         "end_index": group["end_index"],
         "summary": summary,
-        "description": merge_timeline_descriptions(timeline_descriptions),
+        "description": build_event_description(events),
+        "scene_events": events,
         "scene_tags": scene_tags,
         "scene_stats": scene_stats,
         "tracking_summary": {
@@ -1056,9 +1771,8 @@ def update_scene_json(scene_json_path, source_payload, indent):
             continue
         source_scene = source_by_token[token]
         existing_description = item.get("description", "")
-        summary_text = source_scene.get("summary", "")
         description_text = source_scene.get("description", "")
-        item["description"] = append_text_sections(existing_description, summary_text, description_text)
+        item["description"] = append_text_sections(existing_description, description_text)
         if "summary" in item:
             del item["summary"]
 
